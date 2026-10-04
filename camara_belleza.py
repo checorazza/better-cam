@@ -37,6 +37,17 @@ L_BROW = [276, 283, 282, 295, 285, 300, 293, 334, 296, 336]
 R_BROW = [46, 53, 52, 65, 55, 70, 63, 105, 66, 107]
 
 # Colores de labial (RGB) que aparecen como botones en el panel.
+# Colores de rubor (RGB). Se aplican por multiplicación sobre la piel: el color final
+# depende de tu tono de piel, y los tonos claros dan un efecto más sutil.
+BLUSH_PRESETS = {
+    "Rosa": (250, 140, 160),
+    "Melocotón": (255, 170, 140),
+    "Coral": (255, 125, 105),
+    "Rosa palo": (235, 160, 170),
+    "Ciruela": (205, 105, 145),
+    "Terracota": (230, 135, 105),
+}
+
 LIP_PRESETS = {
     "Rosa": (225, 90, 120),
     "Rojo": (200, 30, 50),
@@ -60,6 +71,12 @@ ADJUSTMENTS_UI = (("exposure", "Exposición"), ("shadows", "Sombras"), ("highlig
                   ("saturation", "Saturación"))
 ADJUSTMENTS = tuple(k for k, _ in ADJUSTMENTS_UI)
 
+# Selectores de color del panel: tipo -> (atributo de State, colores, título del diálogo).
+COLOR_KINDS = {
+    "lips": ("lip_rgb", LIP_PRESETS, "Color del labial"),
+    "blush": ("blush_rgb", BLUSH_PRESETS, "Color del rubor"),
+}
+
 # --------------------------------------------------------------------------- estado
 
 class State:
@@ -70,6 +87,8 @@ class State:
         self.smooth = 0.6          # 0-1
         self.lips = 0.55           # 0-1 (0 = sin labial)
         self.lip_rgb = LIP_PRESETS["Rosa"]
+        self.blush = 0.0           # 0-1 (0 = sin rubor)
+        self.blush_rgb = BLUSH_PRESETS["Rosa"]
         self.mirror_preview = False
         for k in ADJUSTMENTS:      # ajustes de imagen, -100..100 (0 = sin cambio)
             setattr(self, k, 0)
@@ -89,6 +108,8 @@ class State:
         self.smooth = float(d.get("smooth", self.smooth))
         self.lips = float(d.get("lips", self.lips))
         self.lip_rgb = tuple(d.get("lip_rgb", self.lip_rgb))
+        self.blush = max(0.0, min(1.0, float(d.get("blush", self.blush))))
+        self.blush_rgb = tuple(d.get("blush_rgb", self.blush_rgb))
         self.mirror_preview = bool(d.get("mirror_preview", self.mirror_preview))
         self.enabled = bool(d.get("enabled", self.enabled))
         self.res = tuple(d.get("res", self.res))
@@ -100,7 +121,8 @@ class State:
         try:
             CONFIG.write_text(json.dumps({
                 "camera": camera_name, "smooth": self.smooth, "lips": self.lips,
-                "lip_rgb": list(self.lip_rgb), "mirror_preview": self.mirror_preview,
+                "lip_rgb": list(self.lip_rgb), "blush": self.blush,
+                "blush_rgb": list(self.blush_rgb), "mirror_preview": self.mirror_preview,
                 "enabled": self.enabled, "res": list(self.res),
                 **{k: getattr(self, k) for k in ADJUSTMENTS},
             }))
@@ -240,30 +262,40 @@ class BeautyFilter:
         pts = np.array([(p.x * w, p.y * h) for p in res.face_landmarks[0]], dtype=np.float32)
         return self.euro(pts, now)
 
-    def _skin(self, frame, pts, strength):
+    @staticmethod
+    def _face_box(frame, pts):
+        """Rectángulo (x0, y0, x1, y1) que rodea la cara, o None si es demasiado pequeño."""
         h, w = frame.shape[:2]
         x0, y0 = np.floor(pts[FACE_OVAL].min(axis=0)).astype(int)
         x1, y1 = np.ceil(pts[FACE_OVAL].max(axis=0)).astype(int)
         pad = int(0.08 * max(x1 - x0, y1 - y0))
         x0, y0 = max(x0 - pad, 0), max(y0 - pad, 0)
         x1, y1 = min(x1 + pad, w), min(y1 + pad, h)
-        if x1 - x0 < 20 or y1 - y0 < 20:
-            return frame
+        return None if (x1 - x0 < 20 or y1 - y0 < 20) else (x0, y0, x1, y1)
 
-        roi = frame[y0:y1, x0:x1]
+    @staticmethod
+    def _skin_mask(pts, box):
+        """Máscara suave (alto x ancho, 0-1) de la piel: óvalo de la cara menos ojos, cejas
+        y boca, y con menos peso cerca del borde (evita halo en pelo/fondo)."""
+        x0, y0, x1, y1 = box
         off = np.array([x0, y0], dtype=np.float32)
-
-        # Máscara de piel: óvalo de la cara menos ojos, cejas y boca.
-        mask = np.zeros(roi.shape[:2], np.uint8)
+        mask = np.zeros((y1 - y0, x1 - x0), np.uint8)
         poly(mask, pts[FACE_OVAL] - off)
         for part in (L_EYE, R_EYE, LIPS_OUTER, L_BROW, R_BROW):
             poly(mask, pts[part] - off, 0)
-        k = max(3, (roi.shape[1] // 40) | 1)
+        k = max(3, ((x1 - x0) // 40) | 1)
         mask = cv2.GaussianBlur(mask, (k * 2 + 1, k * 2 + 1), 0).astype(np.float32) / 255.0
-        # Menos efecto cerca del borde del óvalo (evita halo en pelo/fondo).
         core = cv2.erode((mask > 0.98).astype(np.uint8) * 255, np.ones((k, k), np.uint8))
         core = cv2.GaussianBlur(core, (k * 2 + 1, k * 2 + 1), 0).astype(np.float32) / 255.0
-        mask = np.minimum(mask, core)[..., None]
+        return np.minimum(mask, core)
+
+    def _skin(self, frame, pts, strength):
+        box = self._face_box(frame, pts)
+        if box is None:
+            return frame
+        x0, y0, x1, y1 = box
+        roi = frame[y0:y1, x0:x1]
+        mask = self._skin_mask(pts, box)[..., None]
 
         # Alisado que conserva bordes (en media resolución por rendimiento).
         small = cv2.resize(roi, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
@@ -278,6 +310,54 @@ class BeautyFilter:
 
         a = mask * strength
         out = roi.astype(np.float32) * (1 - a) + smooth * a
+        frame[y0:y1, x0:x1] = np.clip(out, 0, 255).astype(np.uint8)
+        return frame
+
+    def _blush(self, frame, pts, strength, rgb):
+        box = self._face_box(frame, pts)
+        if box is None:
+            return frame
+        x0, y0, x1, y1 = box
+        roi = frame[y0:y1, x0:x1]
+
+        # Referencias de la cara, que siguen el giro/inclinación de la cabeza: centro de cada
+        # ojo y de la boca. R_EYE queda a la izquierda de la imagen y L_EYE a la derecha.
+        eye_a, eye_b = pts[R_EYE].mean(axis=0), pts[L_EYE].mean(axis=0)
+        u = eye_b - eye_a                      # línea de los ojos (hacia la derecha de la imagen)
+        mid = (eye_a + eye_b) / 2
+        down = pts[LIPS_OUTER].mean(axis=0) - mid  # de los ojos a la boca
+        scale = float(np.linalg.norm(u))
+        if scale < 8:
+            return frame
+        ang = math.atan2(u[1], u[0])
+        rx, ry = 0.40 * scale, 0.27 * scale    # semiejes de cada mancha
+
+        # Una mancha gaussiana por mejilla, en la "manzana": algo hacia fuera de la pupila
+        # y a media altura entre los ojos y la boca; el eje largo sube hacia la sien.
+        alpha = np.zeros(roi.shape[:2], np.float32)
+        for side in (-1, 1):
+            cx, cy = mid + side * 0.62 * u + 0.5 * down
+            th = ang - side * 0.35
+            c, s_ = math.cos(th), math.sin(th)
+            half = int(1.8 * rx) + 1           # fuera de esta ventana el aporte es ~0
+            wx0, wx1 = max(int(cx) - half, x0), min(int(cx) + half, x1)
+            wy0, wy1 = max(int(cy) - half, y0), min(int(cy) + half, y1)
+            if wx1 <= wx0 or wy1 <= wy0:
+                continue
+            dx = np.arange(wx0, wx1, dtype=np.float32)[None, :] - cx
+            dy = np.arange(wy0, wy1, dtype=np.float32)[:, None] - cy
+            d2 = ((dx * c + dy * s_) / rx) ** 2 + ((dy * c - dx * s_) / ry) ** 2
+            win = alpha[wy0 - y0:wy1 - y0, wx0 - x0:wx1 - x0]
+            np.maximum(win, np.exp(-2.0 * d2), out=win)
+
+        # Solo sobre piel (no ojos, boca ni fuera del óvalo de la cara).
+        alpha *= self._skin_mask(pts, box)
+
+        # Mezcla por multiplicación: conserva la textura de la piel, no parece pintura.
+        r, g, b = rgb
+        tint = np.array([b, g, r], np.float32) / 255.0
+        a = (alpha * (0.7 * strength))[..., None]
+        out = roi.astype(np.float32) * (1 - a * (1 - tint))
         frame[y0:y1, x0:x1] = np.clip(out, 0, 255).astype(np.uint8)
         return frame
 
@@ -313,7 +393,7 @@ class BeautyFilter:
 
     def apply(self, frame):
         s = self.s
-        if not s.enabled or (s.smooth <= 0 and s.lips <= 0):
+        if not s.enabled or (s.smooth <= 0 and s.lips <= 0 and s.blush <= 0):
             return frame
         pts = self._landmarks(frame)
         if pts is None:
@@ -321,6 +401,8 @@ class BeautyFilter:
         frame = frame.copy()
         if s.smooth > 0:
             frame = self._skin(frame, pts, s.smooth)
+        if s.blush > 0:
+            frame = self._blush(frame, pts, s.blush, s.blush_rgb)
         if s.lips > 0:
             frame = self._lips(frame, pts, s.lips, s.lip_rgb)
         return frame
@@ -414,7 +496,9 @@ class App:
 
         main = ttk.Frame(root, padding=10)
         main.grid()
-        self.preview = ttk.Label(main)
+        left = ttk.Frame(main)  # vista previa + ajustes de imagen
+        left.grid(row=0, column=0, sticky="n")
+        self.preview = ttk.Label(left)
         self.preview.grid(row=0, column=0, sticky="n")
 
         panel = ttk.Frame(main, padding=(14, 0, 0, 0))
@@ -454,20 +538,16 @@ class App:
         ttk.Scale(panel, from_=0, to=100, variable=self.lips_var,
                   command=lambda _=None: self.on_change()).grid(sticky="we", pady=(2, 8))
 
-        ttk.Label(panel, text="Color del labial", font=("Segoe UI", 10, "bold")).grid(sticky="w")
-        sw = ttk.Frame(panel)
-        sw.grid(sticky="w", pady=(4, 0))
-        self.swatches = {}
-        for k, (name, rgb) in enumerate(LIP_PRESETS.items()):
-            b = tk.Button(sw, bg=hex_color(rgb), width=3, height=1, bd=2, relief="raised",
-                          activebackground=hex_color(rgb), cursor="hand2",
-                          command=lambda c=rgb: self.set_color(c))
-            b.grid(row=k // 4, column=k % 4, padx=2, pady=2)
-            self.swatches[name] = (b, rgb)
-        ttk.Button(sw, text="Otro…", width=6, command=self.pick_color).grid(
-            row=1, column=3, padx=2, pady=2)
-        self.color_lbl = ttk.Label(panel, text="")
-        self.color_lbl.grid(sticky="w", pady=(2, 12))
+        self.swatches, self.color_lbls = {}, {}  # por tipo: "lips" / "blush"
+        self._color_picker(panel, "lips", "Color del labial", LIP_PRESETS, bottom=12)
+
+        # Rubor
+        ttk.Label(panel, text="Intensidad del rubor", font=("Segoe UI", 10, "bold")).grid(
+            sticky="w")
+        self.blush_var = tk.DoubleVar(value=state.blush * 100)
+        ttk.Scale(panel, from_=0, to=100, variable=self.blush_var,
+                  command=lambda _=None: self.on_change()).grid(sticky="we", pady=(2, 8))
+        self._color_picker(panel, "blush", "Color del rubor", BLUSH_PRESETS, bottom=12)
 
         # Vista previa
         self.mirror_var = tk.BooleanVar(value=state.mirror_preview)
@@ -475,7 +555,7 @@ class App:
                         variable=self.mirror_var, command=self.on_change).grid(sticky="w")
 
         # Ajustes de imagen (bajo la vista previa)
-        img = ttk.LabelFrame(main, text="Imagen", padding=(10, 4, 10, 8))
+        img = ttk.LabelFrame(left, text="Imagen", padding=(10, 4, 10, 8))
         img.grid(row=1, column=0, sticky="we", pady=(10, 0))
         self.adj = {}  # nombre -> (variable, etiqueta de valor)
         for k, (key, title) in enumerate(ADJUSTMENTS_UI):  # 3 por fila: título + deslizador
@@ -501,7 +581,8 @@ class App:
         self.err_lbl.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         self.refresh_cams(initial=True)
-        self.set_color(state.lip_rgb, save=False)
+        for kind in COLOR_KINDS:
+            self.set_color(kind, getattr(state, COLOR_KINDS[kind][0]), save=False)
         self.tick()
 
     # -- cámara
@@ -533,22 +614,43 @@ class App:
         self.s.res = RESOLUTIONS[self.res_var.get()]
         self.on_change()
 
-    # -- labial
-    def set_color(self, rgb, save=True):
-        self.s.lip_rgb = tuple(int(c) for c in rgb)
-        for b, c in self.swatches.values():
-            b.config(relief="sunken" if tuple(c) == self.s.lip_rgb else "raised",
-                     bd=4 if tuple(c) == self.s.lip_rgb else 2)
-        name = next((n for n, (_, c) in self.swatches.items() if tuple(c) == self.s.lip_rgb),
+    # -- colores (labial y rubor)
+    def _color_picker(self, parent, kind, title, presets, bottom):
+        """Botones de colores + 'Otro…' + etiqueta con el color elegido."""
+        ttk.Label(parent, text=title, font=("Segoe UI", 10, "bold")).grid(sticky="w")
+        sw = ttk.Frame(parent)
+        sw.grid(sticky="w", pady=(4, 0))
+        self.swatches[kind] = {}
+        for k, (name, rgb) in enumerate(presets.items()):
+            b = tk.Button(sw, bg=hex_color(rgb), width=3, height=1, bd=2, relief="raised",
+                          activebackground=hex_color(rgb), cursor="hand2",
+                          command=lambda c=rgb: self.set_color(kind, c))
+            b.grid(row=k // 4, column=k % 4, padx=2, pady=2)
+            self.swatches[kind][name] = (b, rgb)
+        n = len(presets)
+        ttk.Button(sw, text="Otro…", width=6, command=lambda: self.pick_color(kind)).grid(
+            row=n // 4, column=n % 4, padx=2, pady=2)
+        self.color_lbls[kind] = ttk.Label(parent, text="")
+        self.color_lbls[kind].grid(sticky="w", pady=(2, bottom))
+
+    def set_color(self, kind, rgb, save=True):
+        attr = COLOR_KINDS[kind][0]
+        setattr(self.s, attr, tuple(int(c) for c in rgb))
+        cur = getattr(self.s, attr)
+        for b, c in self.swatches[kind].values():
+            b.config(relief="sunken" if tuple(c) == cur else "raised",
+                     bd=4 if tuple(c) == cur else 2)
+        name = next((n for n, (_, c) in self.swatches[kind].items() if tuple(c) == cur),
                     "Personalizado")
-        self.color_lbl.config(text=f"Seleccionado: {name}")
+        self.color_lbls[kind].config(text=f"Seleccionado: {name}")
         if save:
             self.on_change()
 
-    def pick_color(self):
-        rgb, _ = colorchooser.askcolor(color=hex_color(self.s.lip_rgb), title="Color del labial")
+    def pick_color(self, kind):
+        attr, _, title = COLOR_KINDS[kind]
+        rgb, _ = colorchooser.askcolor(color=hex_color(getattr(self.s, attr)), title=title)
         if rgb:
-            self.set_color(rgb)
+            self.set_color(kind, rgb)
 
     # -- común
     def on_change(self):
@@ -556,6 +658,7 @@ class App:
         s.enabled = self.enabled_var.get()
         s.smooth = round(self.smooth_var.get() / 100, 3)
         s.lips = round(self.lips_var.get() / 100, 3)
+        s.blush = round(self.blush_var.get() / 100, 3)
         s.mirror_preview = self.mirror_var.get()
         for key, (var, lbl) in self.adj.items():
             v = int(round(var.get()))
