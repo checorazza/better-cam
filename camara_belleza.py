@@ -36,7 +36,6 @@ R_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161,
 L_BROW = [276, 283, 282, 295, 285, 300, 293, 334, 296, 336]
 R_BROW = [46, 53, 52, 65, 55, 70, 63, 105, 66, 107]
 
-# Colores de labial (RGB) que aparecen como botones en el panel.
 # Colores de rubor (RGB). Se aplican por multiplicación sobre la piel: el color final
 # depende de tu tono de piel, y los tonos claros dan un efecto más sutil.
 BLUSH_PRESETS = {
@@ -48,6 +47,38 @@ BLUSH_PRESETS = {
     "Terracota": (230, 135, 105),
 }
 
+# Posiciones del rubor (guía de colocación por tipo de cara). Todo es relativo a la cara y se
+# mide en "distancias entre ojos": lat = separación lateral desde el centro, v = altura (0 =
+# línea de los ojos, 1 = boca), rx/ry = semiejes de cada mancha, tilt = inclinación del eje
+# largo hacia la sien (rad), gain = intensidad relativa. `bridge` añade una mancha central
+# sobre la nariz: (v, rx, ry).
+BLUSH_STYLES = {
+    "Diagonal clásico · cara ovalada":
+        dict(lat=0.62, v=0.50, rx=0.40, ry=0.27, tilt=0.35),
+    "Sobre las manzanas · cara redonda":
+        dict(lat=0.60, v=0.52, rx=0.33, ry=0.29, tilt=0.45),
+    "Horizontal · cara alargada":
+        dict(lat=0.66, v=0.50, rx=0.54, ry=0.19, tilt=0.0),
+    "Alto a las sienes · cara corazón":
+        dict(lat=0.72, v=0.36, rx=0.42, ry=0.24, tilt=0.55),
+    "Redondo suave · cara cuadrada":
+        dict(lat=0.62, v=0.50, rx=0.34, ry=0.32, tilt=0.10),
+    "Manzanas hacia fuera · diamante":
+        dict(lat=0.76, v=0.50, rx=0.38, ry=0.27, tilt=0.30),
+    "Mejillas internas · cara ancha":
+        dict(lat=0.44, v=0.44, rx=0.30, ry=0.26, tilt=0.15),
+    "Efecto sol · mejillas y nariz":
+        dict(lat=0.62, v=0.46, rx=0.46, ry=0.19, tilt=0.0, bridge=(0.40, 0.42, 0.15)),
+    "Muñeca · manzanas altas":
+        dict(lat=0.56, v=0.38, rx=0.27, ry=0.25, tilt=0.15),
+    "Elegante · levantado a las sienes":
+        dict(lat=0.76, v=0.40, rx=0.44, ry=0.20, tilt=0.50),
+    "Natural · mínimo sobre manzanas":
+        dict(lat=0.60, v=0.52, rx=0.29, ry=0.25, tilt=0.20, gain=0.65),
+}
+DEFAULT_BLUSH_STYLE = next(iter(BLUSH_STYLES))
+
+# Colores de labial (RGB) que aparecen como botones en el panel.
 LIP_PRESETS = {
     "Rosa": (225, 90, 120),
     "Rojo": (200, 30, 50),
@@ -89,6 +120,7 @@ class State:
         self.lip_rgb = LIP_PRESETS["Rosa"]
         self.blush = 0.0           # 0-1 (0 = sin rubor)
         self.blush_rgb = BLUSH_PRESETS["Rosa"]
+        self.blush_style = DEFAULT_BLUSH_STYLE
         self.mirror_preview = False
         for k in ADJUSTMENTS:      # ajustes de imagen, -100..100 (0 = sin cambio)
             setattr(self, k, 0)
@@ -110,6 +142,8 @@ class State:
         self.lip_rgb = tuple(d.get("lip_rgb", self.lip_rgb))
         self.blush = max(0.0, min(1.0, float(d.get("blush", self.blush))))
         self.blush_rgb = tuple(d.get("blush_rgb", self.blush_rgb))
+        style = d.get("blush_style", self.blush_style)
+        self.blush_style = style if style in BLUSH_STYLES else DEFAULT_BLUSH_STYLE
         self.mirror_preview = bool(d.get("mirror_preview", self.mirror_preview))
         self.enabled = bool(d.get("enabled", self.enabled))
         self.res = tuple(d.get("res", self.res))
@@ -122,7 +156,8 @@ class State:
             CONFIG.write_text(json.dumps({
                 "camera": camera_name, "smooth": self.smooth, "lips": self.lips,
                 "lip_rgb": list(self.lip_rgb), "blush": self.blush,
-                "blush_rgb": list(self.blush_rgb), "mirror_preview": self.mirror_preview,
+                "blush_rgb": list(self.blush_rgb), "blush_style": self.blush_style,
+                "mirror_preview": self.mirror_preview,
                 "enabled": self.enabled, "res": list(self.res),
                 **{k: getattr(self, k) for k in ADJUSTMENTS},
             }))
@@ -313,7 +348,24 @@ class BeautyFilter:
         frame[y0:y1, x0:x1] = np.clip(out, 0, 255).astype(np.uint8)
         return frame
 
-    def _blush(self, frame, pts, strength, rgb):
+    @staticmethod
+    def _stamp(alpha, box, cx, cy, rx, ry, th):
+        """Suma (máximo) una mancha gaussiana elíptica, de semiejes rx/ry y eje largo
+        girado `th`, en `alpha` (que cubre la caja `box` del fotograma)."""
+        x0, y0, x1, y1 = box
+        c, s = math.cos(th), math.sin(th)
+        half = int(1.8 * max(rx, ry)) + 1      # fuera de esta ventana el aporte es ~0
+        wx0, wx1 = max(int(cx) - half, x0), min(int(cx) + half, x1)
+        wy0, wy1 = max(int(cy) - half, y0), min(int(cy) + half, y1)
+        if wx1 <= wx0 or wy1 <= wy0:
+            return
+        dx = np.arange(wx0, wx1, dtype=np.float32)[None, :] - cx
+        dy = np.arange(wy0, wy1, dtype=np.float32)[:, None] - cy
+        d2 = ((dx * c + dy * s) / rx) ** 2 + ((dy * c - dx * s) / ry) ** 2
+        win = alpha[wy0 - y0:wy1 - y0, wx0 - x0:wx1 - x0]
+        np.maximum(win, np.exp(-2.0 * d2), out=win)
+
+    def _blush(self, frame, pts, strength, rgb, style):
         box = self._face_box(frame, pts)
         if box is None:
             return frame
@@ -330,25 +382,19 @@ class BeautyFilter:
         if scale < 8:
             return frame
         ang = math.atan2(u[1], u[0])
-        rx, ry = 0.40 * scale, 0.27 * scale    # semiejes de cada mancha
 
-        # Una mancha gaussiana por mejilla, en la "manzana": algo hacia fuera de la pupila
-        # y a media altura entre los ojos y la boca; el eje largo sube hacia la sien.
+        # Una mancha gaussiana por mejilla, colocada según el estilo elegido; el eje largo
+        # sube hacia la sien en cada lado. Si el estilo lo pide, otra sobre el puente de la nariz.
         alpha = np.zeros(roi.shape[:2], np.float32)
         for side in (-1, 1):
-            cx, cy = mid + side * 0.62 * u + 0.5 * down
-            th = ang - side * 0.35
-            c, s_ = math.cos(th), math.sin(th)
-            half = int(1.8 * rx) + 1           # fuera de esta ventana el aporte es ~0
-            wx0, wx1 = max(int(cx) - half, x0), min(int(cx) + half, x1)
-            wy0, wy1 = max(int(cy) - half, y0), min(int(cy) + half, y1)
-            if wx1 <= wx0 or wy1 <= wy0:
-                continue
-            dx = np.arange(wx0, wx1, dtype=np.float32)[None, :] - cx
-            dy = np.arange(wy0, wy1, dtype=np.float32)[:, None] - cy
-            d2 = ((dx * c + dy * s_) / rx) ** 2 + ((dy * c - dx * s_) / ry) ** 2
-            win = alpha[wy0 - y0:wy1 - y0, wx0 - x0:wx1 - x0]
-            np.maximum(win, np.exp(-2.0 * d2), out=win)
+            cx, cy = mid + side * style["lat"] * u + style["v"] * down
+            self._stamp(alpha, box, cx, cy, style["rx"] * scale, style["ry"] * scale,
+                        ang - side * style["tilt"])
+        if "bridge" in style:
+            v, brx, bry = style["bridge"]
+            cx, cy = mid + v * down
+            self._stamp(alpha, box, cx, cy, brx * scale, bry * scale, ang)
+        strength = min(1.0, strength * style.get("gain", 1.0))
 
         # Solo sobre piel (no ojos, boca ni fuera del óvalo de la cara).
         alpha *= self._skin_mask(pts, box)
@@ -402,7 +448,8 @@ class BeautyFilter:
         if s.smooth > 0:
             frame = self._skin(frame, pts, s.smooth)
         if s.blush > 0:
-            frame = self._blush(frame, pts, s.blush, s.blush_rgb)
+            frame = self._blush(frame, pts, s.blush, s.blush_rgb,
+                                BLUSH_STYLES.get(s.blush_style, BLUSH_STYLES[DEFAULT_BLUSH_STYLE]))
         if s.lips > 0:
             frame = self._lips(frame, pts, s.lips, s.lip_rgb)
         return frame
@@ -547,6 +594,13 @@ class App:
         self.blush_var = tk.DoubleVar(value=state.blush * 100)
         ttk.Scale(panel, from_=0, to=100, variable=self.blush_var,
                   command=lambda _=None: self.on_change()).grid(sticky="we", pady=(2, 8))
+        ttk.Label(panel, text="Posición del rubor", font=("Segoe UI", 10, "bold")).grid(
+            sticky="w")
+        self.blush_style_var = tk.StringVar(value=state.blush_style)
+        style_combo = ttk.Combobox(panel, textvariable=self.blush_style_var, state="readonly",
+                                   values=list(BLUSH_STYLES), width=34)
+        style_combo.grid(sticky="we", pady=(2, 8))
+        style_combo.bind("<<ComboboxSelected>>", lambda _=None: self.on_change())
         self._color_picker(panel, "blush", "Color del rubor", BLUSH_PRESETS, bottom=12)
 
         # Vista previa
@@ -659,6 +713,7 @@ class App:
         s.smooth = round(self.smooth_var.get() / 100, 3)
         s.lips = round(self.lips_var.get() / 100, 3)
         s.blush = round(self.blush_var.get() / 100, 3)
+        s.blush_style = self.blush_style_var.get()
         s.mirror_preview = self.mirror_var.get()
         for key, (var, lbl) in self.adj.items():
             v = int(round(var.get()))

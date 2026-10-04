@@ -13,10 +13,24 @@ Cámara virtual con alisado de piel y labios pintados (Windows + OBS Virtual Cam
 - **Filtros de belleza activados**: interruptor de alisado y labial (apagado = sin esos filtros).
 - **Alisado de piel** e **Intensidad del labial**: deslizadores (labial a 0 = sin labial).
 - **Color del labial**: botones de colores o "Otro…" para elegir cualquiera.
-- **Intensidad del rubor** y **Color del rubor**: dos manchas suaves en las mejillas, que siguen el giro
-  y la inclinación de la cabeza y no pisan ojos ni boca. Arranca en 0 (sin rubor). El color se mezcla por
-  multiplicación con tu piel, así que conserva la textura y el resultado depende de tu tono de piel;
-  sube la intensidad poco a poco, a partir de ~30-40 ya se nota. Botones de colores o "Otro…".
+- **Intensidad del rubor**, **Posición del rubor** y **Color del rubor**: manchas suaves en las mejillas,
+  que siguen el giro y la inclinación de la cabeza y no pisan ojos ni boca. Arranca en 0 (sin rubor).
+  El color se mezcla por multiplicación con tu piel, así que conserva la textura y el resultado depende
+  de tu tono de piel; sube la intensidad poco a poco, a partir de ~30-40 ya se nota.
+  Posiciones (según la guía de colocación por tipo de cara):
+  1. Diagonal clásico · cara ovalada (por defecto)
+  2. Sobre las manzanas · cara redonda
+  3. Horizontal · cara alargada
+  4. Alto a las sienes · cara corazón
+  5. Redondo suave · cara cuadrada
+  6. Manzanas hacia fuera · diamante
+  7. Mejillas internas · cara ancha (efecto lifting)
+  8. Efecto sol · mejillas y nariz
+  9. Muñeca · manzanas altas (juvenil)
+  10. Elegante · levantado a las sienes
+  11. Natural · mínimo sobre manzanas (más suave que el resto)
+
+  Para añadir o retocar posiciones, edita `BLUSH_STYLES` en `camara_belleza.py` (cada una son 5 números).
 - **Imagen** (bajo la vista previa), de -100 a +100 cada uno (0 = sin cambio):
   - **Exposición**: ±2 pasos de luz (EV), calculada en luz lineal como en una cámara.
   - **Sombras**: aclara (+) u oscurece (-) solo los tonos oscuros; el negro puro no se mueve.
