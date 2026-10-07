@@ -1,4 +1,4 @@
-# Cámara Belleza
+# Better Cam
 
 Cámara virtual con filtros de belleza: alisado de piel, labial, rubor, ajustes de imagen y bucle de
 video (Windows + OBS Virtual Camera).
