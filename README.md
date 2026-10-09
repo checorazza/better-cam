@@ -12,6 +12,21 @@ video (Windows + OBS Virtual Camera).
 Arriba a la derecha, **Filtros de belleza activados**: interruptor de todo lo de las pestañas Piel y
 Maquillaje (apagado = sin esos filtros). Los controles están en cuatro pestañas:
 
+### Presets (arriba del panel)
+Guardan tu *look* con un nombre para volver a él cuando quieras.
+- Un preset incluye: alisado, labial (intensidad y color), rubor (intensidad, posición y color) y los 7
+  ajustes de imagen (exposición, temperatura, sombras, luces, brillo, contraste y saturación).
+  **No** incluye la cámara, la resolución, el espejo de la vista previa, el interruptor general ni el bucle.
+- **Guardar como…**: guarda el look actual con el nombre que escribas (hasta 40 letras). Si ya existe uno
+  con ese nombre (sin distinguir mayúsculas), pregunta antes de reemplazarlo.
+- Elegir un preset de la lista lo aplica al instante, moviendo todos los controles.
+- Si tocas algo después de aplicarlo, aparece **● Modificado** y se activa **Actualizar** para guardar
+  los cambios en ese mismo preset. Si no, simplemente elige otro: los cambios sin guardar se pierden.
+- **Borrar** quita el preset de la lista; tus ajustes actuales no cambian.
+- Se guardan en `presets.json` (en la carpeta del programa, ignorado por git). Si el archivo se
+  corrompe, se aparta como `presets.json.bak` y se empieza vacío, sin perder el original.
+- El programa recuerda qué preset estaba elegido al volver a abrirlo.
+
 ### Pestaña Cámara
 - **Cámara**: desplegable con los nombres de tus cámaras (botón "Actualizar lista" si conectas una nueva).
 - **Resolución**: 1280×720, 960×540 (recomendada) o 640×480. Cambiarla reinicia la cámara virtual un instante.

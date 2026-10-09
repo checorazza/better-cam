@@ -10,7 +10,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from types import SimpleNamespace
 
 import cv2
@@ -117,6 +117,12 @@ COLOR_KINDS = {
     "blush": ("blush_rgb", BLUSH_PRESETS, "Color del rubor"),
 }
 
+# Lo que guarda un preset: el "look" (filtros de belleza + ajustes de imagen). No incluye la
+# cámara, la resolución, el espejo de la vista previa ni el bucle: eso es de cada sesión.
+LOOK_KEYS = ("smooth", "lips", "lip_rgb", "blush", "blush_rgb", "blush_style") + ADJUSTMENTS
+PRESETS_PATH = HERE / "presets.json"  # {nombre: look}
+PRESET_NAME_MAX = 40
+
 # --------------------------------------------------------------------------- estado
 
 class State:
@@ -133,6 +139,7 @@ class State:
         self.mirror_preview = False
         for k in ADJUSTMENTS:      # ajustes de imagen, -100..100 (0 = sin cambio)
             setattr(self, k, 0)
+        self.preset_name = ""      # preset seleccionado en el panel ("" = ninguno)
         self.cam_index = None     # índice DirectShow pedido por el panel
         self.res = (960, 540)      # resolución de captura pedida por el panel
         # Bucle de video: el panel pide cosas con *_request y el worker contesta con loop_*.
@@ -152,26 +159,54 @@ class State:
         self.latest = None         # último fotograma procesado (BGR)
         self.stop = threading.Event()
 
+    # -- el "look": filtros de belleza + ajustes de imagen (lo que guardan los presets)
+    @staticmethod
+    def _num(v, default, lo, hi):
+        try:
+            return max(lo, min(hi, float(v)))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _rgb(v, default):
+        try:
+            r, g, b = (max(0, min(255, int(c))) for c in v)
+            return (r, g, b)
+        except (TypeError, ValueError):
+            return default
+
+    def snapshot(self):
+        """El look actual como un dict listo para guardar en JSON."""
+        d = {k: getattr(self, k) for k in LOOK_KEYS}
+        d["lip_rgb"], d["blush_rgb"] = list(self.lip_rgb), list(self.blush_rgb)
+        return d
+
+    def apply_look(self, d):
+        """Pone el look desde un dict (de la configuración o de un preset). Valida y limita
+        cada valor; lo que falte o esté mal queda como estaba."""
+        self.smooth = self._num(d.get("smooth"), self.smooth, 0.0, 1.0)
+        self.lips = self._num(d.get("lips"), self.lips, 0.0, 1.0)
+        self.blush = self._num(d.get("blush"), self.blush, 0.0, 1.0)
+        self.lip_rgb = self._rgb(d.get("lip_rgb"), self.lip_rgb)
+        self.blush_rgb = self._rgb(d.get("blush_rgb"), self.blush_rgb)
+        style = d.get("blush_style", self.blush_style)
+        self.blush_style = style if style in BLUSH_STYLES else DEFAULT_BLUSH_STYLE
+        for k in ADJUSTMENTS:
+            setattr(self, k, int(self._num(d.get(k), getattr(self, k), -100, 100)))
+
     def load(self):
         try:
             d = json.loads(CONFIG.read_text())
         except Exception:
             return {}
-        self.smooth = float(d.get("smooth", self.smooth))
-        self.lips = float(d.get("lips", self.lips))
-        self.lip_rgb = tuple(d.get("lip_rgb", self.lip_rgb))
-        self.blush = max(0.0, min(1.0, float(d.get("blush", self.blush))))
-        self.blush_rgb = tuple(d.get("blush_rgb", self.blush_rgb))
-        style = d.get("blush_style", self.blush_style)
-        self.blush_style = style if style in BLUSH_STYLES else DEFAULT_BLUSH_STYLE
+        self.apply_look(d)
         self.mirror_preview = bool(d.get("mirror_preview", self.mirror_preview))
         self.enabled = bool(d.get("enabled", self.enabled))
         self.res = tuple(d.get("res", self.res))
         self.loop_pingpong = bool(d.get("loop_pingpong", self.loop_pingpong))
         secs = d.get("rec_seconds", self.rec_seconds)
         self.rec_seconds = secs if secs in REC_OPTIONS else 10
-        for k in ADJUSTMENTS:
-            setattr(self, k, max(-100, min(100, int(d.get(k, 0)))))
+        self.preset_name = str(d.get("preset", ""))
         return d  # loop_play nunca se restaura: el bucle jamás arranca solo
 
     def save(self, camera_name):
@@ -183,10 +218,55 @@ class State:
                 "mirror_preview": self.mirror_preview,
                 "enabled": self.enabled, "res": list(self.res),
                 "loop_pingpong": self.loop_pingpong, "rec_seconds": self.rec_seconds,
+                "preset": self.preset_name,
                 **{k: getattr(self, k) for k in ADJUSTMENTS},
             }))
         except OSError:
             pass
+
+
+def same_look(a, b, tol=0.0015):
+    """¿Dos looks (dicts) son el mismo? Tolera los redondeos de los deslizadores."""
+    for k in LOOK_KEYS:
+        va, vb = a.get(k), b.get(k)
+        if isinstance(va, (list, tuple)) and isinstance(vb, (list, tuple)):
+            differ = list(va) != list(vb)
+        elif isinstance(va, (int, float)) and isinstance(vb, (int, float)):
+            differ = abs(va - vb) > tol
+        else:
+            differ = va != vb
+        if differ:
+            return False
+    return True
+
+
+def load_presets():
+    """{nombre: look} desde presets.json. Si el archivo está corrupto se aparta como
+    presets.json.bak (para no perderlo) y se empieza de cero."""
+    try:
+        data = json.loads(PRESETS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not all(isinstance(v, dict) for v in data.values()):
+            raise ValueError("formato no válido")
+        return data
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        try:
+            PRESETS_PATH.replace(PRESETS_PATH.with_suffix(".json.bak"))
+        except OSError:
+            pass
+        return {}
+
+
+def save_presets(presets):
+    """Guarda los presets (escritura atómica). Devuelve None, o un texto con el error."""
+    tmp = PRESETS_PATH.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(presets, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(PRESETS_PATH)
+        return None
+    except OSError as e:
+        return str(e)
 
 
 # --------------------------------------------------------------------------- cámaras
@@ -878,21 +958,45 @@ class App:
         panel = ttk.Frame(main, padding=(14, 0, 0, 0))
         panel.grid(row=0, column=1, sticky="n")
 
+        # Presets (siempre visibles): guardar el look actual con un nombre y volver a él.
+        self.presets = load_presets()
+        if state.preset_name not in self.presets:
+            state.preset_name = ""
+        pf = ttk.LabelFrame(panel, text="Preset", padding=(8, 2, 8, 6))
+        pf.grid(row=0, column=0, sticky="we")
+        pf.columnconfigure(0, weight=1)
+        self.preset_var = tk.StringVar(value=state.preset_name)
+        self.preset_combo = ttk.Combobox(pf, textvariable=self.preset_var, state="readonly")
+        self.preset_combo.grid(row=0, column=0, sticky="we")
+        self.preset_combo.bind("<<ComboboxSelected>>", self.on_preset_selected)
+        pbtns = ttk.Frame(pf)
+        pbtns.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(pbtns, text="Guardar como…", command=self.save_preset_as).pack(side="left")
+        self.preset_update_btn = ttk.Button(pbtns, text="Actualizar", command=self.update_preset)
+        self.preset_update_btn.pack(side="left", padx=6)
+        self.preset_delete_btn = ttk.Button(pbtns, text="Borrar", command=self.delete_preset)
+        self.preset_delete_btn.pack(side="left")
+        self.preset_lbl = ttk.Label(pf, text="", foreground="#555", wraplength=270,
+                                    justify="left")
+        self.preset_lbl.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self._preset_ui = None  # último estado mostrado (para no redibujar en cada tick)
+        self.refresh_presets()
+
         # Interruptor general (siempre visible)
         self.enabled_var = tk.BooleanVar(value=state.enabled)
         ttk.Checkbutton(panel, text="Filtros de belleza activados", variable=self.enabled_var,
-                        command=self.on_change).grid(sticky="w")
+                        command=self.on_change).grid(row=1, column=0, sticky="w", pady=(8, 0))
 
         # Aviso bien visible mientras la cámara virtual emite el bucle y no tu cámara en vivo.
         self.banner = tk.Label(panel, text="▶ Reproduciendo el bucle: no es la cámara en vivo",
                                bg="#b00020", fg="white", font=("Segoe UI", 9, "bold"),
                                padx=8, pady=4)
-        self.banner.grid(row=1, column=0, sticky="we", pady=(6, 0))  # fila fija: si no, al
+        self.banner.grid(row=2, column=0, sticky="we", pady=(6, 0))  # fila fija: si no, al
         self.banner.grid_remove()                                    # ocultarlo Tk la reutiliza
 
         # Pestañas: así el panel no crece sin límite al añadir opciones.
         self.nb = nb = ttk.Notebook(panel)
-        nb.grid(row=2, column=0, sticky="we", pady=(8, 0))
+        nb.grid(row=3, column=0, sticky="we", pady=(8, 0))
         tab_cam, tab_skin, tab_makeup, tab_loop = (ttk.Frame(nb, padding=10) for _ in range(4))
         nb.add(tab_cam, text="Cámara")
         nb.add(tab_skin, text="Piel")
@@ -1106,12 +1210,111 @@ class App:
         s.loop_pingpong = self.pingpong_var.get()
         s.loop_play = self.loop_play_var.get()
         s.rec_seconds = int(self.rec_var.get().split()[0])
+        s.preset_name = self.preset_var.get()
         s.save(self.cam_var.get())
 
     def reset_image(self):
         for var, _ in self.adj.values():
             var.set(0)
         self.on_change()
+
+    # -- presets (el look: filtros de belleza + ajustes de imagen)
+    def refresh_presets(self):
+        self.preset_combo["values"] = sorted(self.presets, key=str.casefold)
+        self._preset_ui = None  # forzar que update_preset_ui redibuje
+
+    def update_preset_ui(self):
+        """Mantiene al día la etiqueta y los botones: ¿hay preset?, ¿cambié algo desde que
+        lo apliqué o lo guardé?"""
+        name = self.preset_var.get()
+        exists = name in self.presets
+        modified = exists and not same_look(self.s.snapshot(), self.presets[name])
+        if (name, exists, modified) == self._preset_ui:
+            return
+        self._preset_ui = (name, exists, modified)
+        self.preset_update_btn.state(["!disabled"] if modified else ["disabled"])
+        self.preset_delete_btn.state(["!disabled"] if exists else ["disabled"])
+        if not exists:
+            self.preset_lbl.config(text=(
+                "Elige uno de la lista o guarda el look actual con «Guardar como…»."
+                if self.presets else
+                "Sin presets. «Guardar como…» guarda el look actual: filtros, colores y "
+                "ajustes de imagen."))
+        elif modified:
+            self.preset_lbl.config(text=f"● Modificado respecto a «{name}». «Actualizar» "
+                                        "guarda los cambios en él.")
+        else:
+            self.preset_lbl.config(text=f"Usando «{name}».")
+
+    def sync_ui_from_state(self):
+        """Pone los controles del panel con los valores del estado (tras aplicar un preset)."""
+        s = self.s
+        self.smooth_var.set(s.smooth * 100)
+        self.lips_var.set(s.lips * 100)
+        self.blush_var.set(s.blush * 100)
+        self.blush_style_var.set(s.blush_style)
+        for kind, (attr, _, _) in COLOR_KINDS.items():
+            self.set_color(kind, getattr(s, attr), save=False)
+        for key, (var, _) in self.adj.items():
+            var.set(getattr(s, key))
+
+    def on_preset_selected(self, _=None):
+        name = self.preset_var.get()
+        if name in self.presets:
+            self.s.apply_look(self.presets[name])
+            self.sync_ui_from_state()
+        self.on_change()
+
+    def _store_presets(self):
+        err = save_presets(self.presets)
+        if err:
+            messagebox.showerror("Presets", f"No pude guardar {PRESETS_PATH.name}:\n{err}")
+        return err is None
+
+    def save_preset_as(self):
+        self.on_change()  # el estado debe reflejar exactamente lo que se ve en el panel
+        name = simpledialog.askstring(
+            "Guardar preset", "Nombre del preset:", parent=self.root,
+            initialvalue=self.preset_var.get())
+        if name is None:
+            return
+        name = " ".join(name.split())[:PRESET_NAME_MAX]  # sin espacios de más, con tope
+        if not name:
+            messagebox.showwarning("Guardar preset", "El nombre no puede estar vacío.")
+            return
+        same = next((k for k in self.presets if k.casefold() == name.casefold()), None)
+        if same is not None:
+            if not messagebox.askyesno("Guardar preset",
+                                       f"Ya existe «{same}». ¿Reemplazarlo con el look actual?"):
+                return
+            name = same
+        self.presets[name] = self.s.snapshot()
+        if self._store_presets():
+            self.preset_var.set(name)
+            self.refresh_presets()
+            self.on_change()
+
+    def update_preset(self):
+        name = self.preset_var.get()
+        if name not in self.presets:
+            return
+        self.on_change()
+        self.presets[name] = self.s.snapshot()
+        if self._store_presets():
+            self.refresh_presets()
+
+    def delete_preset(self):
+        name = self.preset_var.get()
+        if name not in self.presets:
+            return
+        if not messagebox.askyesno("Borrar preset", f"¿Borrar el preset «{name}»?\n"
+                                   "Tus ajustes actuales no cambian."):
+            return
+        del self.presets[name]
+        if self._store_presets():
+            self.preset_var.set("")
+            self.refresh_presets()
+            self.on_change()
 
     # -- bucle
     def start_record(self):
@@ -1166,6 +1369,8 @@ class App:
             self.preview.image = img
         self.status_lbl.config(text=f"{s.status}\n{s.fps:.0f} fps")
         self.err_lbl.config(text=s.error or "")
+
+        self.update_preset_ui()
 
         # Bucle: el worker puede apagarlo solo (p. ej. si se borra); aviso y botones al día.
         if self.loop_play_var.get() != s.loop_play:
